@@ -189,16 +189,12 @@ class WanSCAILToVideo(io.ComfyNode):
             video_frame_offset = max(0, video_frame_offset)
 
         reference_latents = []
-        # Kept parallel with reference_latents. Entries are either a 1-frame 28ch mask tensor or None.
-        # If any reference mask is emitted, None entries are filled with a full-white fallback to keep
-        # the reference-latent and reference-mask frame counts aligned.
         reference_mask_frames = []
         reference_mask_fallback_likes = []
 
         if reference_image is not None:
             reference_image = _upscale_image_batch(reference_image[:1], width, height, "bicubic")
             # Replacement Mode: composite the main reference on a black background using reference_image_mask as alpha matte.
-            # Animation Mode preserves the original single-reference behavior.
             if replacement_mode and reference_image_mask is not None:
                 rm = _upscale_image_batch(reference_image_mask[:1], width, height, "nearest-exact")
                 reference_image = _mask_image_on_black(reference_image, rm)
@@ -212,11 +208,12 @@ class WanSCAILToVideo(io.ComfyNode):
                 reference_mask_frames.append(None)
 
         if additional_reference_images is not None or additional_reference_image_masks is not None:
+            # Must have equal number of additional reference images & masks
             if additional_reference_images is None or additional_reference_image_masks is None:
-                raise ValueError("additional_reference_images and additional_reference_image_masks must either both be connected or both be omitted.")
+                raise ValueError("additional_reference_images and additional_reference_image_masks must either both be connected or both disconnected.")
             if additional_reference_images.shape[0] != additional_reference_image_masks.shape[0]:
                 raise ValueError(
-                    "additional_reference_images and additional_reference_image_masks must have the same batch length. "
+                    "must have the same number of additional_reference_images and additional_reference_image_masks."
                     f"Got {additional_reference_images.shape[0]} image(s) and {additional_reference_image_masks.shape[0]} mask(s)."
                 )
 
@@ -239,10 +236,8 @@ class WanSCAILToVideo(io.ComfyNode):
             reference_mask_frames.append(_extract_mask_to_28ch(bg_mask_hw))
 
         if reference_latents:
-            # SCAIL consumes one singular reference_latent tensor. Multiple reference images must
-            # therefore be represented as multiple temporal frames inside that one tensor, not as
-            # multiple list entries. Keep the outer list because Comfy's existing conditioning path
-            # expects reference_latents to be a list, then maps it downstream to reference_latent.
+            # SCAIL consumes one singular reference_latent tensor, so multiple reference images must
+            # be represented as temporal frames inside that one tensor.
             combined_reference_latent = torch.cat(reference_latents, dim=2)
             positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [combined_reference_latent]}, append=True)
             negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [combined_reference_latent]}, append=True)
