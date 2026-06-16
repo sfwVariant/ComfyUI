@@ -118,6 +118,19 @@ def _extract_mask_to_28ch(rgb_video):
     return out.unsqueeze(0)
 
 
+def _upscale_image_batch(image_batch, width, height, mode="bicubic"):
+    return comfy.utils.common_upscale(image_batch.movedim(-1, 1), width, height, mode, "center").movedim(1, -1)
+
+
+def _mask_image_on_black(image_batch, mask_batch, threshold=0.1):
+    visible = (mask_batch[..., :3].max(dim=-1, keepdim=True).values > threshold).to(image_batch.dtype)
+    return image_batch * visible
+
+
+def _full_white_reference_mask(width, height, like_tensor):
+    return torch.ones((1, height, width, 3), device=like_tensor.device, dtype=like_tensor.dtype)
+
+
 class WanSCAILToVideo(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -138,8 +151,11 @@ class WanSCAILToVideo(io.ComfyNode):
                 io.Float.Input("pose_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Strength of the pose latent."),
                 io.Float.Input("pose_start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Start step of the pose conditioning."),
                 io.Float.Input("pose_end", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="End step of the pose conditioning."),
-                io.Image.Input("reference_image", optional=True, tooltip="Reference image, for multiple references composite all on single image."),
+                io.Image.Input("reference_image", optional=True, tooltip="Main reference image."),
                 io.Image.Input("reference_image_mask", optional=True, tooltip="SCAIL-2 only. Colored reference mask at the same resolution as reference_image."),
+                io.Image.Input("additional_reference_images", optional=True, tooltip="SCAIL-2 only. Optional batched extra reference images. Each image is paired by batch index with additional_reference_image_masks."),
+                io.Image.Input("additional_reference_image_masks", optional=True, tooltip="SCAIL-2 only. Optional batched extra reference masks. Must have the same batch length as additional_reference_images."),
+                io.Image.Input("background_reference_image", optional=True, tooltip="SCAIL-2 only. Optional background reference image. A full-white reference mask is generated automatically."),
                 io.ClipVisionOutput.Input("clip_vision_output", optional=True, tooltip="CLIP vision features for conditioning. Model is trained with stretch resize to aspect ratio."),
                 io.Int.Input("video_frame_offset", default=0, min=0, max=nodes.MAX_RESOLUTION, step=1, tooltip="Cumulative output frame this chunk begins at. Wire from the previous chunk's video_frame_offset output."),
                 io.Int.Input("previous_frame_count", default=5, min=1, max=nodes.MAX_RESOLUTION, step=4, tooltip="Tail frames of previous_frames to anchor. SCAIL-2 trained at 5 (81-frame chunks, 76-frame step)."),
@@ -156,8 +172,9 @@ class WanSCAILToVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, negative, vae, width, height, length, batch_size, pose_strength, pose_start, pose_end,
-                video_frame_offset, previous_frame_count, replacement_mode=False, reference_image=None, clip_vision_output=None, pose_video=None,
-                pose_video_mask=None, reference_image_mask=None, previous_frames=None) -> io.NodeOutput:
+                video_frame_offset, previous_frame_count, replacement_mode=False, reference_image=None, reference_image_mask=None,
+                additional_reference_images=None, additional_reference_image_masks=None, background_reference_image=None,
+                clip_vision_output=None, pose_video=None, pose_video_mask=None, previous_frames=None) -> io.NodeOutput:
         latent = torch.zeros([batch_size, 16, ((length - 1) // 4) + 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
         noise_mask = None
 
@@ -171,19 +188,81 @@ class WanSCAILToVideo(io.ComfyNode):
             video_frame_offset -= prev_trimmed.shape[0]
             video_frame_offset = max(0, video_frame_offset)
 
-        ref_latent = None
-        if reference_image is not None:
-            reference_image = comfy.utils.common_upscale(reference_image[:1].movedim(-1, 1), width, height, "bicubic", "center").movedim(1, -1)
-            # Replacement Mode: composite ref on black bg using reference_image_mask as alpha matte
-            if replacement_mode and reference_image_mask is not None:
-                rm = comfy.utils.common_upscale(reference_image_mask[:1].movedim(-1, 1), width, height, "nearest-exact", "center").movedim(1, -1)
-                is_char = (rm[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(reference_image.dtype)
-                reference_image = reference_image * is_char
-            ref_latent = vae.encode(reference_image[:, :, :, :3])
+        reference_latents = []
+        # Kept parallel with reference_latents. Entries are either a 1-frame 28ch mask tensor or None.
+        # If any reference mask is emitted, None entries are filled with a full-white fallback to keep
+        # the reference-latent and reference-mask frame counts aligned.
+        reference_mask_frames = []
+        reference_mask_fallback_likes = []
 
-        if ref_latent is not None:
-            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [ref_latent]}, append=True)
-            negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [ref_latent]}, append=True)
+        if reference_image is not None:
+            reference_image = _upscale_image_batch(reference_image[:1], width, height, "bicubic")
+            # Replacement Mode: composite the main reference on a black background using reference_image_mask as alpha matte.
+            # Animation Mode preserves the original single-reference behavior.
+            if replacement_mode and reference_image_mask is not None:
+                rm = _upscale_image_batch(reference_image_mask[:1], width, height, "nearest-exact")
+                reference_image = _mask_image_on_black(reference_image, rm)
+            reference_latents.append(vae.encode(reference_image[:, :, :, :3]))
+            reference_mask_fallback_likes.append(reference_image)
+
+            if reference_image_mask is not None:
+                ref_mask_hw = _upscale_image_batch(reference_image_mask[:1], width, height, "bicubic")
+                reference_mask_frames.append(_extract_mask_to_28ch(ref_mask_hw))
+            else:
+                reference_mask_frames.append(None)
+
+        if additional_reference_images is not None or additional_reference_image_masks is not None:
+            if additional_reference_images is None or additional_reference_image_masks is None:
+                raise ValueError("additional_reference_images and additional_reference_image_masks must either both be connected or both be omitted.")
+            if additional_reference_images.shape[0] != additional_reference_image_masks.shape[0]:
+                raise ValueError(
+                    "additional_reference_images and additional_reference_image_masks must have the same batch length. "
+                    f"Got {additional_reference_images.shape[0]} image(s) and {additional_reference_image_masks.shape[0]} mask(s)."
+                )
+
+            for i in range(additional_reference_images.shape[0]):
+                add_ref = _upscale_image_batch(additional_reference_images[i:i + 1], width, height, "bicubic")
+                add_mask_for_image = _upscale_image_batch(additional_reference_image_masks[i:i + 1], width, height, "nearest-exact")
+                add_ref = _mask_image_on_black(add_ref, add_mask_for_image)
+                reference_latents.append(vae.encode(add_ref[:, :, :, :3]))
+                reference_mask_fallback_likes.append(add_ref)
+
+                add_mask_hw = _upscale_image_batch(additional_reference_image_masks[i:i + 1], width, height, "bicubic")
+                reference_mask_frames.append(_extract_mask_to_28ch(add_mask_hw))
+
+        if background_reference_image is not None:
+            background_reference_image = _upscale_image_batch(background_reference_image[:1], width, height, "bicubic")
+            reference_latents.append(vae.encode(background_reference_image[:, :, :, :3]))
+            reference_mask_fallback_likes.append(background_reference_image)
+
+            bg_mask_hw = _full_white_reference_mask(width, height, background_reference_image)
+            reference_mask_frames.append(_extract_mask_to_28ch(bg_mask_hw))
+
+        if reference_latents:
+            # SCAIL consumes one singular reference_latent tensor. Multiple reference images must
+            # therefore be represented as multiple temporal frames inside that one tensor, not as
+            # multiple list entries. Keep the outer list because Comfy's existing conditioning path
+            # expects reference_latents to be a list, then maps it downstream to reference_latent.
+            combined_reference_latent = torch.cat(reference_latents, dim=2)
+            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": [combined_reference_latent]}, append=True)
+            negative = node_helpers.conditioning_set_values(negative, {"reference_latents": [combined_reference_latent]}, append=True)
+
+        if any(mask_frame is not None for mask_frame in reference_mask_frames):
+            normalized_reference_mask_frames = []
+            for mask_frame, like_tensor in zip(reference_mask_frames, reference_mask_fallback_likes):
+                if mask_frame is None:
+                    fallback_mask_hw = _full_white_reference_mask(width, height, like_tensor)
+                    mask_frame = _extract_mask_to_28ch(fallback_mask_hw)
+                normalized_reference_mask_frames.append(mask_frame)
+
+            zeros = torch.zeros(
+                (1, latent.shape[2], 28, normalized_reference_mask_frames[0].shape[-2], normalized_reference_mask_frames[0].shape[-1]),
+                device=normalized_reference_mask_frames[0].device,
+                dtype=normalized_reference_mask_frames[0].dtype,
+            )
+            ref_mask_28ch = torch.cat(normalized_reference_mask_frames + [zeros], dim=1)
+            positive = node_helpers.conditioning_set_values(positive, {"ref_mask_28ch": ref_mask_28ch})
+            negative = node_helpers.conditioning_set_values(negative, {"ref_mask_28ch": ref_mask_28ch})
 
         if clip_vision_output is not None:
             positive = node_helpers.conditioning_set_values(positive, {"clip_vision_output": clip_vision_output})
@@ -220,14 +299,6 @@ class WanSCAILToVideo(io.ComfyNode):
             driving_mask_28ch = _extract_mask_to_28ch(mask_video_hw)
             positive = node_helpers.conditioning_set_values(positive, {"driving_mask_28ch": driving_mask_28ch})
             negative = node_helpers.conditioning_set_values(negative, {"driving_mask_28ch": driving_mask_28ch})
-
-        if reference_image_mask is not None:
-            ref_mask_hw = comfy.utils.common_upscale(reference_image_mask[:1].movedim(-1, 1), width, height, "bicubic", "center").movedim(1, -1)
-            ref_mask_1f = _extract_mask_to_28ch(ref_mask_hw)
-            zeros = torch.zeros((1, latent.shape[2], 28, ref_mask_1f.shape[-2], ref_mask_1f.shape[-1]), device=ref_mask_1f.device, dtype=ref_mask_1f.dtype)
-            ref_mask_28ch = torch.cat([ref_mask_1f, zeros], dim=1)
-            positive = node_helpers.conditioning_set_values(positive, {"ref_mask_28ch": ref_mask_28ch})
-            negative = node_helpers.conditioning_set_values(negative, {"ref_mask_28ch": ref_mask_28ch})
 
         if prev_trimmed is not None:
             pf = comfy.utils.common_upscale(prev_trimmed.movedim(-1, 1), width, height, "bicubic", "center").movedim(1, -1)
