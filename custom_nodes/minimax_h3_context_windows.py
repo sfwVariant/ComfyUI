@@ -6,7 +6,8 @@ Phase 1 + ref2va scope:
 - joint video/audio slicing
 - H3's non-uniform video-token timing is used to map video windows to audio
 - absolute target video/audio RoPE positions are preserved across windows
-- all ref2va reference blocks are retained in every window
+- ref2va reference blocks are retained in every window by default
+- reference video 1/2 can optionally slide with the target context window
 - FL2VA keyframes, FreeNoise, causal anchors, and non-static schedules are intentionally unsupported
 """
 
@@ -39,11 +40,17 @@ def _video_indices_to_audio_indices(video_indices, audio_t):
     for idx in video_indices:
         start = starts[idx]
         end = start + spans[idx]
-        # Audio latent j occupies [j, j+1). Exclude boundary-only contacts.
         a_start = max(math.floor(start + 1e-9), 0)
         a_stop = min(math.ceil(end - 1e-9), int(audio_t))
         selected.update(range(a_start, a_stop))
     return sorted(selected)
+
+
+def _index_select(tensor, dim, indices):
+    if tensor is None:
+        return None
+    idx = torch.tensor(indices, dtype=torch.long, device=tensor.device)
+    return tensor.index_select(dim, idx)
 
 
 @dataclass
@@ -57,8 +64,6 @@ class _MiniMaxH3WindowingState(cw.WindowingState):
         video_total = self.latents[0].shape[2]
         audio_total = self.latents[1].shape[3]
         audio_indices = _video_indices_to_audio_indices(window.index_list, audio_total)
-
-        # Used only for fuse-weight shape. The actual audio indices are derived from H3 time.
         audio_overlap = max(round(window.context_overlap * audio_total / video_total), 0)
 
         audio_window = cw.IndexListContextWindow(
@@ -76,7 +81,6 @@ class _MiniMaxH3WindowingState(cw.WindowingState):
         )
 
     def slice_for_window(self, window, retain_index_list, device=None):
-        # H3 T2VA/ref2va has no context-window guide-frame injection.
         video_window = window
         audio_window = window.get_window_for_modality(1)
         return [
@@ -160,9 +164,7 @@ class _MiniMaxH3ContextHandler(cw.IndexListContextHandler):
             )
             for result in results:
                 for mod_idx in range(2):
-                    mod_out = [
-                        result.sub_conds_out[ci][mod_idx] for ci in range(len(conds))
-                    ]
+                    mod_out = [result.sub_conds_out[ci][mod_idx] for ci in range(len(conds))]
                     modality_window = result.window.get_window_for_modality(mod_idx)
                     self.combine_context_window_results(
                         window_state.latents[mod_idx],
@@ -234,9 +236,7 @@ class _MiniMaxH3ContextHandler(cw.IndexListContextHandler):
                 sigma=timestep,
                 context_overlap=window.context_overlap,
             )
-            weights_tensor = cw.match_weights_to_dim(
-                weights, x_in, dim, device=x_in.device
-            )
+            weights_tensor = cw.match_weights_to_dim(weights, x_in, dim, device=x_in.device)
             for i in range(len(sub_conds_out)):
                 window.add_window(conds_final[i], sub_conds_out[i] * weights_tensor)
                 window.add_window(counts_final[i], weights_tensor)
@@ -259,8 +259,108 @@ class _MiniMaxH3ContextHandler(cw.IndexListContextHandler):
             )
 
 
-def _set_h3_absolute_target_positions(layout, video_indices, audio_indices):
-    """Replace only the target AV temporal coordinates; refs keep their normal layout."""
+def _slice_reference_videos(refs, slide_flags, video_indices, full_target_video_t):
+    refs = list(refs or [])
+    out = []
+    video_ordinal = 0
+
+    for original in refs:
+        block = dict(original)
+        kind = block.get("kind")
+        if kind in ("video", "video_audio"):
+            video_ordinal += 1
+            should_slide = video_ordinal <= len(slide_flags) and bool(slide_flags[video_ordinal - 1])
+            if should_slide:
+                original_vt = int(original.get("latent_t", 0))
+                if original_vt != int(full_target_video_t):
+                    raise ValueError(
+                        f"MiniMax H3 slide_reference_video_{video_ordinal}=True requires reference "
+                        f"video {video_ordinal} to have the same frame count as the target output "
+                        f"(target latent_t={full_target_video_t}, reference latent_t={original_vt})."
+                    )
+
+                block["latent"] = _index_select(original["latent"], 2, video_indices)
+                block["latent_t"] = len(video_indices)
+                block["_context_video_indices"] = list(video_indices)
+
+                original_audio_t = int(original.get("ref_audio_t", 0))
+                if original_audio_t > 0 and original.get("audio_latent") is not None:
+                    ref_audio_indices = _video_indices_to_audio_indices(video_indices, original_audio_t)
+                    block["audio_latent"] = _index_select(original["audio_latent"], 3, ref_audio_indices)
+                    block["ref_audio_t"] = len(ref_audio_indices)
+                    block["_context_audio_indices"] = ref_audio_indices
+
+        out.append(block)
+
+    for ordinal, enabled in enumerate(slide_flags, start=1):
+        if enabled and video_ordinal < ordinal:
+            raise ValueError(
+                f"MiniMax H3 slide_reference_video_{ordinal}=True, but reference video "
+                f"{ordinal} was not provided."
+            )
+
+    return out
+
+
+def _set_audio_temporal_positions(position_ids, start, audio_t, cursor, indices):
+    if audio_t <= 0:
+        return
+    idx = torch.tensor(indices, dtype=torch.float64)
+    position_ids[start:start + audio_t, 0] = cursor + idx
+    position_ids[start + audio_t:start + audio_t * 2, 0] = cursor + idx
+
+
+def _restore_full_reference_positions(layout, original_refs, window_refs, text_len):
+    row = int(text_len)
+    cursor = float(text_len)
+
+    for original, block in zip(original_refs, window_refs):
+        kind = original["kind"]
+
+        if kind == "image":
+            r_frame, _ = h3_model._frame_grid(block["latent_h"], block["latent_w"])
+            n = r_frame.shape[0]
+            layout.position_ids[row:row + n, 0] = cursor
+            row += n
+            cursor += 1.0
+            continue
+
+        if kind == "audio":
+            original_rt = int(original.get("ref_audio_t", 0))
+            rt = int(block.get("ref_audio_t", 0))
+            indices = block.get("_context_audio_indices", list(range(rt)))
+            _set_audio_temporal_positions(layout.position_ids, row, rt, cursor, indices)
+            row += rt * 2
+            cursor += float(original_rt)
+            continue
+
+        if kind not in ("video", "video_audio"):
+            raise ValueError(f"Unsupported MiniMax H3 reference kind: {kind!r}")
+
+        original_rt = int(original.get("ref_audio_t", 0))
+        rt = int(block.get("ref_audio_t", 0))
+        if rt > 0:
+            audio_indices = block.get("_context_audio_indices", list(range(rt)))
+            _set_audio_temporal_positions(layout.position_ids, row, rt, cursor, audio_indices)
+            row += rt * 2
+
+        vt = int(block["latent_t"])
+        original_vt = int(original["latent_t"])
+        video_indices = block.get("_context_video_indices", list(range(vt)))
+        r_frame, _ = h3_model._frame_grid(block["latent_h"], block["latent_w"])
+        frame_rows = r_frame.shape[0]
+        n = vt * frame_rows
+        global_grid = h3_model._video_t_grid(original_vt, cursor)[video_indices]
+        video_pos = layout.position_ids[row:row + n].view(vt, frame_rows, 3)
+        video_pos[:, :, 0] = global_grid[:, None]
+        row += n
+
+        cursor += max(float(original_rt), sum(h3_model._video_t_spans(original_vt)))
+
+    return cursor
+
+
+def _set_h3_absolute_target_positions(layout, video_indices, audio_indices, target_cursor):
     audio_seg = next((seg for seg in layout.segments if seg[2] == "audio"), None)
     video_seg = next((seg for seg in layout.segments if seg[2] == "video"), None)
     if audio_seg is None or video_seg is None:
@@ -274,22 +374,11 @@ def _set_h3_absolute_target_positions(layout, video_indices, audio_indices):
     if ab - aa != audio_t * 2:
         raise RuntimeError("MiniMax H3 audio layout/window length mismatch.")
 
-    if audio_t:
-        target_cursor = float(layout.position_ids[aa, 0])
-    elif video_t:
-        target_cursor = float(layout.position_ids[va, 0])
-    else:
-        return
-
-    audio_idx = torch.tensor(audio_indices, dtype=torch.float64)
-    layout.position_ids[aa:aa + audio_t, 0] = target_cursor + audio_idx
-    layout.position_ids[aa + audio_t:ab, 0] = target_cursor + audio_idx
+    _set_audio_temporal_positions(layout.position_ids, aa, audio_t, float(target_cursor), audio_indices)
 
     if video_t:
         frame_rows = (vb - va) // video_t
-        global_grid = h3_model._video_t_grid(
-            max(video_indices) + 1, target_cursor
-        )[video_indices]
+        global_grid = h3_model._video_t_grid(max(video_indices) + 1, float(target_cursor))[video_indices]
         video_pos = layout.position_ids[va:vb].view(video_t, frame_rows, 3)
         video_pos[:, :, 0] = global_grid[:, None]
 
@@ -338,16 +427,30 @@ def _h3_context_layout_wrapper(
             f"video {len(video_indices)} != {latent_t}, audio {len(audio_indices)} != {audio_t}."
         )
 
-    # refs=... deliberately includes every ref2va block in every window.
+    original_refs = list(payload.get("refs") or [])
+    slide_flags = transformer_options.get("minimax_h3_slide_reference_videos", (False, False))
+    full_target_video_t = int(window.total_frames)
+    window_refs = _slice_reference_videos(
+        original_refs, slide_flags, video_indices, full_target_video_t
+    )
+
+    if original_refs:
+        payload["refs"] = window_refs
+        payload["cond_video_latents"] = [r["latent"] for r in window_refs if "latent" in r]
+        payload["cond_audio_latents"] = [
+            r["audio_latent"] for r in window_refs if r.get("audio_latent") is not None
+        ]
+
     layout = h3_model.PackedLayout(
         text_len,
         latent_t,
         lat_h,
         lat_w,
         audio_t,
-        refs=payload.get("refs"),
+        refs=window_refs,
     )
-    _set_h3_absolute_target_positions(layout, video_indices, audio_indices)
+    target_cursor = _restore_full_reference_positions(layout, original_refs, window_refs, text_len)
+    _set_h3_absolute_target_positions(layout, video_indices, audio_indices, target_cursor)
     payload["layout"] = layout
 
     return executor(
@@ -398,6 +501,20 @@ class MiniMaxH3ContextWindows:
                     cw.ContextFuseMethods.LIST_STATIC,
                     {"default": cw.ContextFuseMethods.PYRAMID},
                 ),
+                "slide_reference_video_1": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Slide reference video 1 with the target context window. Requires the same frame count as the target.",
+                    },
+                ),
+                "slide_reference_video_2": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Slide reference video 2 with the target context window. Requires the same frame count as the target.",
+                    },
+                ),
             }
         }
 
@@ -406,7 +523,15 @@ class MiniMaxH3ContextWindows:
     CATEGORY = "model/patch/minimax"
     EXPERIMENTAL = True
 
-    def patch(self, model, context_length, context_overlap, fuse_method):
+    def patch(
+        self,
+        model,
+        context_length,
+        context_overlap,
+        fuse_method,
+        slide_reference_video_1=False,
+        slide_reference_video_2=False,
+    ):
         model = model.clone()
 
         latent_context_length = _decoded_frames_to_video_latents(context_length)
@@ -414,14 +539,10 @@ class MiniMaxH3ContextWindows:
             latent_context_overlap = 0
         else:
             latent_context_overlap = max(round(context_overlap * 5 / 17), 1)
-            latent_context_overlap = min(
-                latent_context_overlap, latent_context_length - 1
-            )
+            latent_context_overlap = min(latent_context_overlap, latent_context_length - 1)
 
         model.model_options["context_handler"] = _MiniMaxH3ContextHandler(
-            context_schedule=cw.get_matching_context_schedule(
-                cw.ContextSchedules.STATIC_STANDARD
-            ),
+            context_schedule=cw.get_matching_context_schedule(cw.ContextSchedules.STATIC_STANDARD),
             fuse_method=cw.get_matching_fuse_method(fuse_method),
             context_length=latent_context_length,
             context_overlap=latent_context_overlap,
@@ -431,6 +552,15 @@ class MiniMaxH3ContextWindows:
             freenoise=False,
             causal_window_fix=False,
         )
+
+        to = model.model_options["transformer_options"] = model.model_options.get(
+            "transformer_options", {}
+        ).copy()
+        to["minimax_h3_slide_reference_videos"] = (
+            bool(slide_reference_video_1),
+            bool(slide_reference_video_2),
+        )
+
         cw.create_prepare_sampling_wrapper(model)
         model.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
